@@ -43,10 +43,10 @@ class ExecutionEnv:
     def create(cls, offload_dir):
         # fix recursive import
         from flexgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-        gpu = TorchDevice("cuda:0")
+        dtu = TorchDevice("xla")
         cpu = TorchDevice("cpu")
         disk = TorchDisk(offload_dir)
-        return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+        return cls(gpu=dtu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([dtu, cpu, disk]))
 
     def close_copy_threads(self):
         self.disk.close_copy_threads()
