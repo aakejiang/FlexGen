@@ -12,6 +12,7 @@ from typing import Optional, Union, Tuple
 import torch
 import torch.nn.functional as F
 import numpy as np
+import torch_gcu
 
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
@@ -35,6 +36,7 @@ class DeviceType(Enum):
     DISK = auto()
     MIXED = auto()
     COMPRESSED = auto()
+    GCU = auto()
 
     @staticmethod
     def convert(name):
@@ -48,6 +50,8 @@ class DeviceType(Enum):
             return DeviceType.MIXED
         elif name == "compressed":
             return DeviceType.COMPRESSED
+        elif name == "xla":
+            return DeviceType.GCU
         else:
             raise ValueError(f"Invalid name: {name}")
 
@@ -164,7 +168,11 @@ class TorchDevice:
         self.mem_capacity = mem_capacity
         self.flops = flops
 
-        self.dev = torch.device(name)
+        # self.dev = torch.device(name)
+        if name == 'xla':
+            self.dev = torch_gcu.gcu_device()
+        else:
+            self.dev = torch.device(name)
         self.device_type = DeviceType.convert(self.dev.type)
         self.compressed_device = TorchCompressedDevice(self)
 
@@ -182,10 +190,11 @@ class TorchDevice:
         self.links[dst] = link
 
     def allocate(self, shape, dtype, pin_memory=None, name=None):
-        if self.device_type == DeviceType.CPU:
-            pin_memory = True if pin_memory is None else pin_memory
-        else:
-            pin_memory = False
+        # if self.device_type == DeviceType.CPU:
+        #     pin_memory = True if pin_memory is None else pin_memory
+        # else:
+        #     pin_memory = False
+        pin_memory = False
         dtype = np_dtype_to_torch_dtype[dtype]
         data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
         return TorchTensor.create_from_torch(data, self, name=name)
@@ -337,13 +346,16 @@ class TorchDevice:
 
         # shape: (b, n_head, s, s)
         attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        ### fix where op build bug: param2 and param3 type must match
+        attn_weights = torch.where(mask, attn_weights.double(), -1e4)
         attn_weights = attn_weights.view(b * n_head, s, s)
         attn_weights = F.softmax(attn_weights, dim=2)
         # shape: (b, n_head, s, head_dim)
         value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
         # shape: (b, s, h)
-        value = value.transpose(1, 2).reshape(b, s, h)
+        ### fix general_dot compile bug: param1 fp32, param2 fp16
+        ### so add half() to covert to fp16
+        value = value.transpose(1, 2).reshape(b, s, h).half()
         value = F.linear(value, w_out.data, bias=b_out.data)
 
         value.add_(inputs.data)
@@ -398,6 +410,8 @@ class TorchDevice:
         # shape: (1, b * n_head, head_dim)
         v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
 
+        dtu_device = torch_gcu.gcu_device()
+
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache:
@@ -416,14 +430,19 @@ class TorchDevice:
                 # shape: (b * n_head, s, head_dim)
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
 
-                if k.is_cuda:
+                # if k.is_cuda:
+                if k.device.type == 'xla':
+                    print('tensor type is XLA')
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
+                    # value = self._attention_value(q, k, v, attention_mask.data,
+                    #     b, src_s, tgt_s, n_head, head_dim).cuda().half()
                     value = self._attention_value(q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim).cuda().half()
+                        b, src_s, tgt_s, n_head, head_dim)
+                    value = value.to(dtu_device).half()
             else:  # Sparse attention
                 # shape: (s, b * n_head, head_dim)
                 k = k_cache.data[:src_s]
@@ -431,15 +450,19 @@ class TorchDevice:
                 # shape: (b * n_head, head_dim, s)
                 k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
 
-                if k.is_cuda:
+                if k.device.type == 'xla' or k.is_cuda:
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
                         attn_sparsity)
                 else:
                     q = q.float().cpu()
+                    # value = self._sparse_attention_value(q, k, v_new, v_cache,
+                    #     attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
+                    #     attn_sparsity).cuda().half()
                     value = self._sparse_attention_value(q, k, v_new, v_cache,
                         attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity).cuda().half()
+                        attn_sparsity)
+                    value = value.to(dtu_device).half()
         else:  # Mixed device attention
             assert attn_sparsity >= 1.0
             value = self._mixed_device_attention(q, k_cache, v_cache,
@@ -470,12 +493,14 @@ class TorchDevice:
 
     def _attention_weights(self, q, k, mask, b, src_s, n_head):
         # shape: (b * n_head, 1, s)
+        # Performs a batch matrix-matrix product of matrices stored in q and k.
         attn_weights = torch.bmm(q, k)
         # shape: (b, 1, 1, s)
         mask = mask.view(b, 1, 1, src_s)
         # shape: (b * n_head, 1, s)
         attn_weights = attn_weights.view(b, n_head, 1, src_s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        ### fix where op build bug: param2 and param3 type must match
+        attn_weights = torch.where(mask, attn_weights.double(), -1e4)
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
         attn_weights = F.softmax(attn_weights, dim=2)
         return attn_weights
@@ -483,6 +508,9 @@ class TorchDevice:
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
         # shape: (b * n_head, 1, s)
         attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
+        ## fix general_dot op build error: input params type must match
+        ## attn_weights and v are fp16
+        attn_weights = attn_weights.half()
         # shape: (b, n_head, 1, head_dim)
         return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
 
@@ -542,7 +570,9 @@ class TorchDevice:
         # shape: (b * n_head, s, head_dim)
         v_gpu = v_gpu.permute(1, 0, 2)
 
-        mask_gpu = mask[:b_gpu].cuda()
+        # mask_gpu = mask[:b_gpu].cuda()
+        dtu_device = torch_gcu.gcu_device()
+        mask_gpu = mask[:b_gpu].to(dtu_device)
         value_gpu = self._attention_value(q_gpu, k_gpu, v_gpu, mask_gpu,
             b_gpu, src_s, tgt_s, n_head, head_dim)
 
@@ -563,7 +593,8 @@ class TorchDevice:
         value_cpu = self._attention_value(q_cpu, k_cpu, v_cpu, mask_cpu,
             b_cpu, src_s, tgt_s, n_head, head_dim)
 
-        value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
+        # value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
+        value = torch.cat([value_gpu, value_cpu.to(dtu_device).half()], dim=0)
         return value
 
     def mlp(self, inputs, wi, bi, wo, bo, w_ln, b_ln, donate):
@@ -584,7 +615,8 @@ class TorchDevice:
         return TorchTensor.create_from_torch(out, self)
 
     def synchronize(self):
-        torch.cuda.synchronize()
+        if self.device_type == DeviceType.CUDA:
+            torch.cuda.synchronize()
 
     def mem_stats(self):
         if self.device_type == DeviceType.CUDA:
@@ -593,13 +625,17 @@ class TorchDevice:
         elif self.device_type == DeviceType.CPU:
             cur_mem = cpu_mem_stats()
             peak_mem = 0
+        elif self.device_type == DeviceType.GCU:
+            cur_mem = 0
+            peak_mem = 0
         else:
             raise NotImplementedError()
 
         return cur_mem, peak_mem
 
     def print_stats(self, output_file=None):
-        torch.cuda.synchronize()
+        if self.device_type == DeviceType.CUDA:
+            torch.cuda.synchronize()
         cur_mem, peak_mem = self.mem_stats()
 
         if output_file is not None:
@@ -877,30 +913,33 @@ def map_to_torch_tensor(tensor, indices):
 
 def copy_worker_func(queue, cuda_id):
     """The copy worker thread."""
-    torch.cuda.set_device(cuda_id)
+    # torch.cuda.set_device(cuda_id)
 
-    cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
-    copy_stream = torch.cuda.Stream()
+    # cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+    cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=False)
 
-    with torch.cuda.stream(copy_stream):
-        while True:
-            item = queue.get()
-            if item is None:
-                queue.task_done()
-                return
-
-            dst, dst_indices, src, src_indices = item
-            src_data = map_to_torch_tensor(src, src_indices)
-            dst_data = map_to_torch_tensor(dst, dst_indices)
-
-            if (src.device.device_type == DeviceType.CUDA or
-                dst.device.device_type == DeviceType.CUDA):
-                # Use a pinned cpu buffer as a relay
-                size = np.prod(src_data.shape)
-                tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
-                tmp_cpu_buf.copy_(src_data)
-                dst_data.copy_(tmp_cpu_buf)
-            else:
-                dst_data.copy_(src_data)
-
+    # copy_stream = torch.cuda.Stream()
+    # with torch.cuda.stream(copy_stream):
+    while True:
+        item = queue.get()
+        if item is None:
             queue.task_done()
+            return
+
+        dst, dst_indices, src, src_indices = item
+        src_data = map_to_torch_tensor(src, src_indices)
+        dst_data = map_to_torch_tensor(dst, dst_indices)
+
+        if (src.device.device_type == DeviceType.CUDA or
+            dst.device.device_type == DeviceType.CUDA or
+            src.device.device_type == DeviceType.GCU or
+            dst.device.device_type == DeviceType.GCU):
+            # Use a pinned cpu buffer as a relay
+            size = np.prod(src_data.shape)
+            tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+            tmp_cpu_buf.copy_(src_data)
+            dst_data.copy_(tmp_cpu_buf)
+        else:
+            dst_data.copy_(src_data)
+
+        queue.task_done()
