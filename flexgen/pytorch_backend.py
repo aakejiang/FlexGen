@@ -12,7 +12,7 @@ from typing import Optional, Union, Tuple
 import torch
 import torch.nn.functional as F
 import numpy as np
-import torch_dtu as torch_gcu
+import torch_dtu
 
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
@@ -36,7 +36,7 @@ class DeviceType(Enum):
     DISK = auto()
     MIXED = auto()
     COMPRESSED = auto()
-    GCU = auto()
+    DTU = auto()
 
     @staticmethod
     def convert(name):
@@ -51,7 +51,7 @@ class DeviceType(Enum):
         elif name == "compressed":
             return DeviceType.COMPRESSED
         elif name == "xla":
-            return DeviceType.GCU
+            return DeviceType.DTU
         else:
             raise ValueError(f"Invalid name: {name}")
 
@@ -170,7 +170,7 @@ class TorchDevice:
 
         # self.dev = torch.device(name)
         if name == 'xla':
-            self.dev = torch_gcu.gcu_device()
+            self.dev = torch_dtu.dtu_device()
         else:
             self.dev = torch.device(name)
         self.device_type = DeviceType.convert(self.dev.type)
@@ -410,7 +410,7 @@ class TorchDevice:
         # shape: (1, b * n_head, head_dim)
         v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
 
-        dtu_device = torch_gcu.gcu_device()
+        dtu_device = torch_dtu.dtu_device()
 
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
@@ -571,7 +571,7 @@ class TorchDevice:
         v_gpu = v_gpu.permute(1, 0, 2)
 
         # mask_gpu = mask[:b_gpu].cuda()
-        dtu_device = torch_gcu.gcu_device()
+        dtu_device = torch_dtu.dtu_device()
         mask_gpu = mask[:b_gpu].to(dtu_device)
         value_gpu = self._attention_value(q_gpu, k_gpu, v_gpu, mask_gpu,
             b_gpu, src_s, tgt_s, n_head, head_dim)
@@ -625,7 +625,7 @@ class TorchDevice:
         elif self.device_type == DeviceType.CPU:
             cur_mem = cpu_mem_stats()
             peak_mem = 0
-        elif self.device_type == DeviceType.GCU:
+        elif self.device_type == DeviceType.DTU:
             cur_mem = 0
             peak_mem = 0
         else:
@@ -932,8 +932,8 @@ def copy_worker_func(queue, cuda_id):
 
         if (src.device.device_type == DeviceType.CUDA or
             dst.device.device_type == DeviceType.CUDA or
-            src.device.device_type == DeviceType.GCU or
-            dst.device.device_type == DeviceType.GCU):
+            src.device.device_type == DeviceType.DTU or
+            dst.device.device_type == DeviceType.DTU):
             # Use a pinned cpu buffer as a relay
             size = np.prod(src_data.shape)
             tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)

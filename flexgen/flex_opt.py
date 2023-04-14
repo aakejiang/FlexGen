@@ -14,7 +14,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
-import torch_dtu as torch_gcu
+import torch_dtu
 
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
@@ -30,7 +30,7 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
-PLACE_ON_GCU = True
+PLACE_ON_DTU = True
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -138,7 +138,7 @@ class InputEmbed:
         self.config = config
         self.env = env
         self.policy = policy
-        # TorchDevice for GPU/GCU
+        # TorchDevice for GPU/DTU
         self.compute = self.env.gpu
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
@@ -599,7 +599,7 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
-        self.gcu_device = torch_gcu.gcu_device()
+        self.dtu_device = torch_dtu.dtu_device()
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -750,14 +750,14 @@ class OptLM:
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
             if i == 0:  # load from the input ids
-                if PLACE_ON_GCU:
+                if PLACE_ON_DTU:
                     val = TorchTensor.create_from_torch(self.output_ids[left:right, :self.task.prompt_len], dst)
                 else:
                     val = dst.allocate((gpu_batch_size, self.task.prompt_len), np.int32)
                     val.load_from_np(self.output_ids[left:right, :self.task.prompt_len])
             else:  # load from the last generated token
                 pos = self.task.prompt_len + i
-                if PLACE_ON_GCU:
+                if PLACE_ON_DTU:
                     val = TorchTensor.create_from_torch(self.output_ids[left:right, pos-1:pos], dst)
                 else:
                     val = dst.allocate((gpu_batch_size, 1), np.int32)
@@ -781,14 +781,14 @@ class OptLM:
         if j == self.num_layers - 1:  # store to output
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            if PLACE_ON_GCU:
+            if PLACE_ON_DTU:
                 ids = self.hidden[i][j][k].pop().data.detach()
             else:
                 ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
             pos = self.task.prompt_len + i
             if self.task.stop:
                 stopped = self.stopped[left:right]
-                if PLACE_ON_GCU:
+                if PLACE_ON_DTU:
                     self.output_ids[left:right, pos:pos + 1] = torch.where(
                         stopped, self.config.pad_token_id, ids)
                     stopped[:] = torch.logical_or(stopped, ids == self.task.stop)
@@ -839,8 +839,8 @@ class OptLM:
 
         attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
-        ## place on GCU
-        if PLACE_ON_GCU:
+        ## place on DTU
+        if PLACE_ON_DTU:
             val = TorchTensor.create_from_torch((input_ids != self.config.pad_token_id), attention_compute)
         else:
             val = attention_compute.allocate(
@@ -875,12 +875,12 @@ class OptLM:
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
 
         # Output token ids
-        ## place output token ids on GCU memory
-        if PLACE_ON_GCU:
+        ## place output token ids on DTU memory
+        if PLACE_ON_DTU:
             self.output_ids = torch.full((len(task.inputs), prompt_len + gen_len),
-                self.config.pad_token_id, dtype=torch.int64, device=self.gcu_device)
-            self.stopped = torch.zeros((len(task.inputs), 1), dtype=torch.bool, device=self.gcu_device)
-            self.output_ids[:, :prompt_len] = torch.tensor(np.asarray(task.inputs), device=self.gcu_device)
+                self.config.pad_token_id, dtype=torch.int64, device=self.dtu_device)
+            self.stopped = torch.zeros((len(task.inputs), 1), dtype=torch.bool, device=self.dtu_device)
+            self.output_ids[:, :prompt_len] = torch.tensor(np.asarray(task.inputs), device=self.dtu_device)
         else:
             # Output token ids
             self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
@@ -1226,11 +1226,11 @@ def run_flexgen(args):
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     # gpu = TorchDevice("cuda:0")
-    gcu = TorchDevice("xla")
+    dtu = TorchDevice("xla")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     # env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-    env = ExecutionEnv(gpu=gcu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gcu, cpu, disk]))
+    env = ExecutionEnv(gpu=dtu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([dtu, cpu, disk]))
 
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1],
@@ -1267,8 +1267,8 @@ def run_flexgen(args):
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
-        #### if self.output_ids on GCU
-        if PLACE_ON_GCU:
+        #### if self.output_ids on DTU
+        if PLACE_ON_DTU:
             output_ids = output_ids.cpu()
     finally:
         env.close_copy_threads()
