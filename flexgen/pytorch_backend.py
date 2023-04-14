@@ -12,7 +12,7 @@ from typing import Optional, Union, Tuple
 import torch
 import torch.nn.functional as F
 import numpy as np
-import torch_dtu
+import torch_dtu.core.dtu_model as dm
 
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
@@ -170,7 +170,7 @@ class TorchDevice:
 
         # self.dev = torch.device(name)
         if name == 'xla':
-            self.dev = torch_dtu.dtu_device()
+            self.dev = dm.dtu_device()
         else:
             self.dev = torch.device(name)
         self.device_type = DeviceType.convert(self.dev.type)
@@ -410,7 +410,7 @@ class TorchDevice:
         # shape: (1, b * n_head, head_dim)
         v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
 
-        dtu_device = torch_dtu.dtu_device()
+        dtu_device = dm.dtu_device()
 
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
@@ -571,7 +571,7 @@ class TorchDevice:
         v_gpu = v_gpu.permute(1, 0, 2)
 
         # mask_gpu = mask[:b_gpu].cuda()
-        dtu_device = torch_dtu.dtu_device()
+        dtu_device = dm.dtu_device()
         mask_gpu = mask[:b_gpu].to(dtu_device)
         value_gpu = self._attention_value(q_gpu, k_gpu, v_gpu, mask_gpu,
             b_gpu, src_s, tgt_s, n_head, head_dim)

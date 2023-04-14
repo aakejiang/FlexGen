@@ -14,7 +14,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
-import torch_dtu
+import torch_dtu.core.dtu_model as dm
 
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
@@ -599,7 +599,7 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
-        self.dtu_device = torch_dtu.dtu_device()
+        self.dtu_device = dm.dtu_device()
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
